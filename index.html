@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cash Manager – Transparência</title>
+<meta name="description" content="Relatórios públicos do caixa.">
+<style>
+  :root { --pad: 12px; --radius: 14px; --muted:#6b7280; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:0; color:#111; background:#f7f7f8; }
+  header { padding: 20px; background:#fff; border-bottom:1px solid #e6e6e7; position:sticky; top:0; z-index:10; }
+  h1 { margin:0 0 4px; font-size:20px; }
+  .muted { color: var(--muted); font-size: 14px; }
+  main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  .card { background:#fff; border:1px solid #e6e6e7; border-radius: var(--radius); padding: var(--pad); }
+  .row { display:flex; flex-wrap:wrap; gap:10px; align-items:end; }
+  .row > div { min-width: 160px; }
+  label { display:block; font-size:12px; color:#374151; margin-bottom:4px; }
+  input, select, button { width:100%; padding:9px 10px; border:1px solid #d1d5db; border-radius:10px; background:#fff; }
+  button { cursor:pointer; }
+  .btn { background:#111827; color:#fff; border:none; }
+  .btn.secondary { background:#fff; border:1px solid #d1d5db; color:#111; }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  table { width:100%; border-collapse: collapse; }
+  th, td { border-bottom:1px solid #eee; padding:10px; text-align:left; }
+  th { background:#fafafa; font-weight:600; }
+  td.num, th.num { text-align:right; }
+  .toolbar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .summary { display:flex; flex-wrap:wrap; gap:12px; margin-top:10px; }
+  .summary .chip { background:#f3f4f6; border-radius: 999px; padding:6px 10px; font-size:13px; }
+  .footer { margin: 16px 0 60px; color: var(--muted); font-size: 13px; }
+  .error { color:#b91c1c; background:#fee2e2; border:1px solid #fecaca; padding:10px; border-radius:10px; }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Transparência do Caixa</h1>
+  <div class="muted">Dados servidos por <code>/wp-json/cashmgr/v1/ledger</code>.</div>
+</header>
+
+<main>
+  <section class="card" aria-label="filtros">
+    <form id="filters" class="row" onsubmit="return false;">
+      <div style="min-width:120px;">
+        <label for="account_id">Conta (ID)</label>
+        <input id="account_id" name="account_id" type="number" min="1" step="1" required>
+      </div>
+      <div>
+        <label for="from">De (dd/mm/aaaa)</label>
+        <input id="from" name="from" type="text" placeholder="01/08/2025" inputmode="numeric" pattern="\\d{2}/\\d{2}/\\d{4}">
+      </div>
+      <div>
+        <label for="to">Até (dd/mm/aaaa)</label>
+        <input id="to" name="to" type="text" placeholder="31/08/2025" inputmode="numeric" pattern="\\d{2}/\\d{2}/\\d{4}">
+      </div>
+      <div>
+        <label for="per_page">Itens por página</label>
+        <select id="per_page" name="per_page">
+          <option>50</option>
+          <option selected>200</option>
+          <option>500</option>
+          <option>1000</option>
+        </select>
+      </div>
+      <div style="min-width:160px;">
+        <button id="btnLoad" class="btn">Carregar</button>
+      </div>
+      <div>
+        <button id="btnCSV" class="btn secondary" type="button">Exportar CSV</button>
+      </div>
+    </form>
+    <div id="status" class="muted" style="margin-top:6px;"></div>
+    <div id="error" class="error hidden" role="alert" aria-live="assertive"></div>
+    <div class="summary" id="summary"></div>
+  </section>
+
+  <section class="card" style="margin-top:12px;">
+    <div class="toolbar" aria-label="paginaçao">
+      <button id="prev" class="btn secondary" type="button">◀ Anterior</button>
+      <button id="next" class="btn secondary" type="button">Próxima ▶</button>
+      <span id="pageinfo" class="muted"></span>
+    </div>
+
+    <div style="overflow:auto; margin-top:10px;">
+      <table aria-label="movimentaçoes de caixa">
+        <thead>
+          <tr>
+            <th>Data</th>
+            <th>Descrição</th>
+            <th class="num">Receita</th>
+            <th class="num">Taxa (rec.)</th>
+            <th class="num">Despesa</th>
+            <th class="num">Taxa (desp.)</th>
+            <th class="num">Resultante</th>
+            <th class="num">Saldo após</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <p class="footer">Este relatório respeita a confidencialidade: descrições mascaradas no servidor e novamente no cliente.</p>
+</main>
+
+<script>
+/** ===========================
+ * Config – ajuste aqui
+ * =========================== */
+const API_BASE = "https://tech.floripa.br/wp-json/cashmgr/v1/ledger";
+const ACCOUNT_ID_DEFAULT = 1; // substitua pelo id da sua conta pública
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 min
+
+/** ===========================
+ * Utils (DRY, defensivas)
+ * =========================== */
+const $ = sel => document.querySelector(sel);
+const fmtBR = n => (Number(n)||0).toLocaleString('pt-BR',{minimumFractionDigits:2,maximumFractionDigits:2});
+
+function maskDescription(text){
+  if(!text) return "";
+  return text.split(/\s+/).map(w => w.length<=1 ? w : (w[0] + "*".repeat(w.length-1))).join(" ");
+}
+
+function ensureMask(row){
+  // servidor já mascara se masked=1, mas reforçamos no cliente por segurança
+  if (String(row.masked)==="1" || String(row.masked).toLowerCase()==="true") {
+    row.description = maskDescription(row.description);
+  }
+  return row;
+}
+
+function parseQuery(){
+  const u = new URL(location.href);
+  return {
+    account_id: Number(u.searchParams.get("account_id")) || ACCOUNT_ID_DEFAULT,
+    from: u.searchParams.get("from") || "",
+    to: u.searchParams.get("to") || "",
+    per_page: Number(u.searchParams.get("per_page")) || 200,
+    page: Number(u.searchParams.get("page")) || 1
+  };
+}
+
+function updateQuery(params){
+  const u = new URL(location.href);
+  Object.entries(params).forEach(([k,v])=>{
+    if(v===undefined || v===null || v==="") u.searchParams.delete(k);
+    else u.searchParams.set(k, v);
+  });
+  history.replaceState(null, "", u.toString());
+}
+
+function cacheKey(p){
+  return "cashmgr:"+[p.account_id,p.from,p.to,p.page,p.per_page].join("|");
+}
+
+function getCache(p){
+  try{
+    const k = cacheKey(p);
+    const raw = localStorage.getItem(k);
+    if(!raw) return null;
+    const obj = JSON.parse(raw);
+    if(Date.now() - obj.ts > CACHE_TTL_MS) { localStorage.removeItem(k); return null; }
+    return obj.data;
+  } catch { return null; }
+}
+
+function setCache(p, data){
+  try{
+    localStorage.setItem(cacheKey(p), JSON.stringify({ts:Date.now(), data}));
+  } catch { /* ignore quota */ }
+}
+
+function validateDateBR(s){
+  if(!s) return true;
+  return /^\d{2}\/\d{2}\/\d{4}$/.test(s);
+}
+
+function renderError(msg){
+  const el = $("#error");
+  el.textContent = msg || "Erro inesperado.";
+  el.classList.remove("hidden");
+}
+
+function clearError(){ $("#error").classList.add("hidden"); }
+
+/** ===========================
+ * API
+ * =========================== */
+async function fetchLedger(p){
+  const cached = getCache(p);
+  if(cached) return {...cached, cached:true};
+
+  const q = new URLSearchParams({
+    account_id: String(p.account_id),
+    per_page: String(p.per_page),
+    page: String(p.page)
+  });
+  if(p.from) q.set("from", p.from);
+  if(p.to) q.set("to", p.to);
+
+  const url = API_BASE + "?" + q.toString();
+  $("#status").textContent = "Carregando…";
+  const res = await fetch(url, { method:"GET" });
+  if(!res.ok){
+    throw new Error(`Falha HTTP ${res.status}`);
+  }
+  const data = await res.json();
+  setCache(p, data);
+  return data;
+}
+
+/** ===========================
+ * UI render
+ * =========================== */
+function renderTable(rows){
+  const tb = $("#tbody");
+  tb.innerHTML = "";
+  rows.forEach(r=>{
+    ensureMask(r);
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${r.event_at}</td>
+      <td>${escapeHtml(r.description || "")}</td>
+      <td class="num">${fmtBR(r.income)}</td>
+      <td class="num">${fmtBR(r.income_fee)}</td>
+      <td class="num">${fmtBR(r.expense)}</td>
+      <td class="num">${fmtBR(r.expense_fee)}</td>
+      <td class="num">${fmtBR(r.result_amount)}</td>
+      <td class="num">${fmtBR(r.balance_after)}</td>
+    `;
+    tb.appendChild(tr);
+  });
+}
+
+function renderSummary(totals){
+  const s = $("#summary");
+  s.innerHTML = `
+    <span class="chip">Receita: <strong>R$ ${fmtBR(totals.income)}</strong></span>
+    <span class="chip">Taxas (rec.): <strong>R$ ${fmtBR(totals.income_fee)}</strong></span>
+    <span class="chip">Despesa: <strong>R$ ${fmtBR(totals.expense)}</strong></span>
+    <span class="chip">Taxas (desp.): <strong>R$ ${fmtBR(totals.expense_fee)}</strong></span>
+    <span class="chip">Resultado: <strong>R$ ${fmtBR(totals.result)}</strong></span>
+    <span class="chip">Saldo final: <strong>R$ ${fmtBR(totals.balance_last)}</strong></span>
+  `;
+}
+
+function renderPagination(pagination){
+  $("#pageinfo").textContent = `Página ${pagination.page} de ${pagination.total_pages} — ${pagination.total} registros`;
+  $("#prev").disabled = pagination.page <= 1;
+  $("#next").disabled = pagination.page >= pagination.total_pages;
+}
+
+function escapeHtml(s){
+  return s.replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));
+}
+
+/** ===========================
+ * CSV Export
+ * =========================== */
+function toCSV(rows){
+  const header = ["id","event_at","description","income","income_fee","expense","expense_fee","result_amount","balance_after","masked"];
+  const esc = v => `"${String(v??"").replace(/"/g,'""')}"`;
+  const lines = [header.join(",")];
+  rows.forEach(r=>{
+    ensureMask(r);
+    lines.push([
+      r.id, r.event_at, r.description,
+      r.income, r.income_fee, r.expense, r.expense_fee,
+      r.result_amount, r.balance_after, r.masked
+    ].map(esc).join(","));
+  });
+  return lines.join("\n");
+}
+
+function download(filename, content, type="text/plain"){
+  const blob = new Blob([content], {type});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+/** ===========================
+ * App bootstrap
+ * =========================== */
+(async function init(){
+  const qp = parseQuery();
+  $("#account_id").value = qp.account_id;
+  $("#from").value = qp.from || "";
+  $("#to").value = qp.to || "";
+  $("#per_page").value = String(qp.per_page);
+
+  $("#btnLoad").addEventListener("click", async ()=>{
+    clearError();
+    const account_id = Number($("#account_id").value);
+    const from = $("#from").value.trim();
+    const to = $("#to").value.trim();
+    const per_page = Number($("#per_page").value) || 200;
+
+    if(!account_id || account_id<1){ renderError("Informe um ID de conta válido."); return; }
+    if(!validateDateBR(from) || !validateDateBR(to)){ renderError("Datas devem estar em dd/mm/aaaa."); return; }
+
+    const state = { account_id, from, to, page:1, per_page };
+    updateQuery(state);
+    await load(state);
+  });
+
+  $("#prev").addEventListener("click", async ()=>{
+    const s = parseQuery();
+    if(s.page>1){ s.page--; updateQuery(s); await load(s); }
+  });
+  $("#next").addEventListener("click", async ()=>{
+    const s = parseQuery();
+    s.page++; updateQuery(s); await load(s);
+  });
+
+  $("#btnCSV").addEventListener("click", async ()=>{
+    clearError();
+    const s = parseQuery();
+    try{
+      const data = await fetchLedger(s);
+      const csv = toCSV(data.rows || []);
+      const name = `caixa_${s.account_id}_${(s.from||'ini').replace(/\//g,'-')}_${(s.to||'fim').replace(/\//g,'-')}_p${s.page}.csv`;
+      download(name, csv, "text/csv;charset=utf-8");
+    } catch(e){
+      renderError("Falha ao exportar CSV.");
+    }
+  });
+
+  // Carrega o estado inicial da URL
+  try {
+    await load(qp);
+  } catch(e){}
+})();
+
+async function load(state){
+  try{
+    $("#status").textContent = "Carregando…";
+    clearError();
+    const data = await fetchLedger(state);
+    renderTable(data.rows || []);
+    renderSummary(data.totals || {});
+    renderPagination(data.pagination || {page:1,total_pages:1,total:0});
+    $("#status").textContent = data.cached ? "Dados via cache local" : "Dados atualizados";
+  } catch(e){
+    console.error(e);
+    renderError("Não foi possível carregar os dados. Verifique a conta, o período ou tente mais tarde.");
+    $("#status").textContent = "";
+  }
+}
+</script>
+</body>
+</html>
